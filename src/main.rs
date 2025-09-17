@@ -14,36 +14,42 @@
 use chrono::prelude::*;
 use clap::Parser;
 use rayon::prelude::*;
+use rosbags_rs::Reader;
 use rosbags_rs::cdr::CdrDeserializer;
 use rosbags_rs::messages::FromCdr;
 use rosbags_rs::types::Connection;
-use rosbags_rs::Reader;
 use rumpus::prelude::*;
 use rumpus_ros::messages::*;
 use sguaba::engineering::Orientation;
 use sguaba::systems::{EquivalentTo, Wgs84};
-use sguaba::{system, Coordinate};
+use sguaba::{Coordinate, system};
 use std::path::PathBuf;
 use uom::si::{
-    angle::{degree, Angle},
-    length::{meter, micron, millimeter, Length},
+    angle::{Angle, degree},
+    length::{Length, meter, micron, millimeter},
 };
 
 #[derive(Parser)]
 struct Cli {
     bag_path: PathBuf,
-    output_dir: PathBuf,
+
+    #[arg(short, long)]
+    output_dir: Option<PathBuf>,
+
+    #[arg(short, long)]
+    max_images: Option<usize>,
 }
 
 fn main() {
     let args = Cli::parse();
+    let output_dir = args.output_dir.unwrap_or("./".into());
     let topic_name = "/novatel/oem7/inspvax";
     let pixel_size = Length::new::<micron>(3.45 * 2.);
     let focal_length = Length::new::<millimeter>(8.);
     let image_rows = 1024;
     let image_cols = 1224;
 
-    std::fs::create_dir_all(&args.output_dir).unwrap();
+    std::fs::create_dir_all(&output_dir).unwrap();
 
     let mut reader = Reader::new(&args.bag_path).unwrap();
     reader.open().unwrap();
@@ -67,7 +73,10 @@ fn main() {
         .map(|(row, col)| image_sensor.at_pixel(row, col).unwrap())
         .collect();
 
-    for (i, result) in messages.take(3).enumerate() {
+    for (i, result) in messages
+        .enumerate()
+        .take_while(|(i, _result)| args.max_images.is_none_or(|ref max| i < max))
+    {
         let message = result.unwrap();
         let mut deserializer = CdrDeserializer::new(&message.data).unwrap();
         let inspvax = InsPvaX::from_cdr(&mut deserializer).unwrap();
@@ -108,7 +117,7 @@ fn main() {
 
         let frame_id = format!("frame_{}.png", i);
         let mut image_path = PathBuf::new();
-        image_path.push(&args.output_dir);
+        image_path.push(&output_dir);
         image_path.push(&frame_id);
 
         // Save the buffer of RGB pixels as a PNG.
@@ -120,6 +129,8 @@ fn main() {
             image::ExtendedColorType::Rgb8,
         )
         .expect("valid image and path");
+
+        println!("wrote image");
     }
 }
 
