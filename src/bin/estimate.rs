@@ -1,22 +1,10 @@
-//!
-//! ## Parameters
-//!
-//! - Change over time:
-//!   - Yaw, pitch, roll
-//!   - Longitude, latitude
-//!   - Time
-//! - Constant with time:
-//!   - Lens focal length
-//!   - Sensor dimensions
-//!   - Pixel size
-//!
-
 use chrono::prelude::*;
 use clap::Parser;
 use rayon::prelude::*;
 use rosbags_rs::Reader;
 use rosbags_rs::cdr::CdrDeserializer;
 use rosbags_rs::messages::FromCdr;
+use rosbags_rs::messages::Image;
 use rosbags_rs::types::Connection;
 use rumpus::prelude::*;
 use rumpus_ros::messages::*;
@@ -29,108 +17,77 @@ use uom::si::{
     length::{Length, meter, micron, millimeter},
 };
 
+const INS_TOPIC_NAME: &str = "/novatel/oem7/inspvax";
+const CAM_TOPIC_NAME: &str = "/arena_camera_node/image_raw";
+
 #[derive(Parser)]
 struct Cli {
     bag_path: PathBuf,
 
     #[arg(short, long)]
-    output_dir: Option<PathBuf>,
-
-    #[arg(short, long)]
-    max_images: Option<usize>,
+    max_msgs: Option<usize>,
 }
 
 fn main() {
     let args = Cli::parse();
-    let output_dir = args.output_dir.unwrap_or("./".into());
-    let topic_name = "/novatel/oem7/inspvax";
-    let pixel_size = Length::new::<micron>(3.45 * 2.);
-    let focal_length = Length::new::<millimeter>(8.);
-    let image_rows = 1024;
-    let image_cols = 1224;
-
-    std::fs::create_dir_all(&output_dir).unwrap();
 
     let mut reader = Reader::new(&args.bag_path).unwrap();
     reader.open().unwrap();
+
+    println!("opened bag");
 
     // Find connections with correct topic.
     let connections: Vec<Connection> = reader
         .connections()
         .iter()
-        .filter(|conn| &conn.topic == &topic_name)
+        .filter(|conn| [INS_TOPIC_NAME, CAM_TOPIC_NAME].contains(&conn.topic.as_str()))
         .cloned()
         .collect();
+
+    for conn in &connections {
+        println!("{}", conn.message_definition.data);
+    }
 
     let messages = reader
         .messages_filtered(Some(&connections), None, None)
         .unwrap();
 
-    let lens = Lens::from_focal_length(focal_length).expect("positive focal length");
-    let image_sensor = ImageSensor::new(pixel_size, pixel_size, image_rows, image_cols);
-    let coords: Vec<Coordinate<CameraFrd>> = (0..image_rows)
-        .flat_map(|row| (0..image_cols).map(move |col| (row, col)))
-        .map(|(row, col)| image_sensor.at_pixel(row, col).unwrap())
-        .collect();
+    println!("filtered messages");
+
+    // Can I make a Kalman filter library that structures filters like iterator consumers?
+    // Collect messages into the filter and advance the state in time.
 
     for (i, result) in messages
         .enumerate()
-        .take_while(|(i, _result)| args.max_images.is_none_or(|ref max| i < max))
+        .take_while(|(i, _result)| args.max_msgs.is_none_or(|ref max| i < max))
     {
         let message = result.unwrap();
         let mut deserializer = CdrDeserializer::new(&message.data).unwrap();
-        let inspvax = InsPvaX::from_cdr(&mut deserializer).unwrap();
-        let state: State<InsEnu> = inspvax.into();
 
-        let sky_model = SkyModel::from_wgs84_and_time(state.position(), state.time());
+        match message.topic.as_str() {
+            INS_TOPIC_NAME => {
+                let inspvax = InsPvaX::from_cdr(&mut deserializer).unwrap();
+                let _state: State<InsEnu> = inspvax.into();
 
-        // Camera aligned with the INS sensor reference frame.
-        let cam_orientation = state.orientation().cast::<CameraEnu>();
+                println!("handled ins message");
+            }
+            CAM_TOPIC_NAME => {
+                let image = Image::from_cdr(&mut deserializer).unwrap();
+                let image_name = format!("frame_{}.png", i);
 
-        let camera = Camera::new(lens.clone(), cam_orientation);
-        let rays: Vec<Ray<_>> = coords
-            .par_iter()
-            .filter_map(|coord| {
-                let bearing_cam_enu = camera
-                    .trace_from_sensor(*coord)
-                    .expect("coord on sensor plane");
-                let aop = sky_model.aop(bearing_cam_enu)?;
+                image::save_buffer(
+                    &image_name,
+                    &image.data[..],
+                    image.width,
+                    image.height,
+                    image::ExtendedColorType::L8,
+                )
+                .unwrap();
 
-                Some(Ray::new(*coord, aop, Dop::new(0.0)))
-            })
-            .collect();
-
-        // Could add RayImage::from_camera_with_sensor
-        let ray_image = RayImage::from_rays_with_sensor(rays, &image_sensor)
-            .expect("no ray hits the same pixel");
-
-        // Map the AoP values in the RayImage to RGB colours.
-        // Draw missing pixels as white.
-        let aop_image: Vec<u8> = ray_image
-            .ray_pixels()
-            .flat_map(|pixel| match pixel {
-                Some(ray) => to_rgb(ray.aop().angle().get::<degree>(), -90.0, 90.0)
-                    .expect("aop in between -90 and 90"),
-                None => [255, 255, 255],
-            })
-            .collect();
-
-        let frame_id = format!("frame_{}.png", i);
-        let mut image_path = PathBuf::new();
-        image_path.push(&output_dir);
-        image_path.push(&frame_id);
-
-        // Save the buffer of RGB pixels as a PNG.
-        image::save_buffer(
-            &image_path,
-            &aop_image,
-            image_cols.into(),
-            image_rows.into(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .expect("valid image and path");
-
-        println!("wrote image");
+                println!("handled cam message");
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
