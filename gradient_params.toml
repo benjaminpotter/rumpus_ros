@@ -1,0 +1,8 @@
+# meters 
+pixel_size = 0.0000069
+focal_length = 0.008
+min_dop = 0.5
+max_iters = 4096
+learning_rate = 1
+convergence_threshold = 0.0001
+
