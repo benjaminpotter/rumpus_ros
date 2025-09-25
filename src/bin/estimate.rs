@@ -36,6 +36,9 @@ struct Cli {
 
     #[arg(short, long)]
     max_msgs: Option<usize>,
+
+    #[arg(short, long)]
+    save_images: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -406,71 +409,75 @@ fn main() {
                             epoch: candidate.epoch,
                         };
 
+                        println!("loss {}", candidate.loss);
                         bag_csv.serialize(estimate).unwrap();
 
-                        // Write a simulated image from the candidate.
+                        if args.save_images {
+                            // Write a simulated image from the candidate.
+                            let sky_model =
+                                SkyModel::from_wgs84_and_time(state.position(), state.time());
 
-                        let sky_model =
-                            SkyModel::from_wgs84_and_time(state.position(), state.time());
+                            // Camera aligned with the INS sensor reference frame.
+                            let cam_orientation = Orientation::<CameraEnu>::tait_bryan_builder()
+                                .yaw(Angle::new::<degree>(candidate.yaw))
+                                .pitch(Angle::new::<degree>(candidate.pitch))
+                                .roll(Angle::new::<degree>(candidate.roll))
+                                .build();
 
-                        // Camera aligned with the INS sensor reference frame.
-                        let cam_orientation = Orientation::<CameraEnu>::tait_bryan_builder()
-                            .yaw(Angle::new::<degree>(candidate.yaw))
-                            .pitch(Angle::new::<degree>(candidate.pitch))
-                            .roll(Angle::new::<degree>(candidate.roll))
-                            .build();
+                            let camera = Camera::new(lens.clone(), cam_orientation);
+                            let image_sensor = ImageSensor::new(
+                                params.pixel_size,
+                                params.pixel_size,
+                                image.height as u16,
+                                image.width as u16,
+                            );
 
-                        let camera = Camera::new(lens.clone(), cam_orientation);
-                        let image_sensor = ImageSensor::new(
-                            params.pixel_size,
-                            params.pixel_size,
-                            image.height as u16,
-                            image.width as u16,
-                        );
+                            let coords: Vec<Coordinate<CameraFrd>> = (0..image.height as u16)
+                                .flat_map(|row| (0..image.width as u16).map(move |col| (row, col)))
+                                .map(|(row, col)| image_sensor.at_pixel(row, col).unwrap())
+                                .collect();
 
-                        let coords: Vec<Coordinate<CameraFrd>> = (0..image.height as u16)
-                            .flat_map(|row| (0..image.width as u16).map(move |col| (row, col)))
-                            .map(|(row, col)| image_sensor.at_pixel(row, col).unwrap())
-                            .collect();
+                            let rays: Vec<Ray<_>> = coords
+                                .par_iter()
+                                .filter_map(|coord| {
+                                    let bearing_cam_enu = camera
+                                        .trace_from_sensor(*coord)
+                                        .expect("coord on sensor plane");
+                                    let aop = sky_model.aop(bearing_cam_enu)?;
 
-                        let rays: Vec<Ray<_>> = coords
-                            .par_iter()
-                            .filter_map(|coord| {
-                                let bearing_cam_enu = camera
-                                    .trace_from_sensor(*coord)
-                                    .expect("coord on sensor plane");
-                                let aop = sky_model.aop(bearing_cam_enu)?;
+                                    Some(Ray::new(*coord, aop, Dop::new(0.0)))
+                                })
+                                .collect();
 
-                                Some(Ray::new(*coord, aop, Dop::new(0.0)))
-                            })
-                            .collect();
+                            // Could add RayImage::from_camera_with_sensor
+                            let ray_image = RayImage::from_rays_with_sensor(rays, &image_sensor)
+                                .expect("no ray hits the same pixel");
 
-                        // Could add RayImage::from_camera_with_sensor
-                        let ray_image = RayImage::from_rays_with_sensor(rays, &image_sensor)
-                            .expect("no ray hits the same pixel");
+                            // Map the AoP values in the RayImage to RGB colours.
+                            // Draw missing pixels as white.
+                            let aop_image: Vec<u8> = ray_image
+                                .ray_pixels()
+                                .flat_map(|pixel| match pixel {
+                                    Some(ray) => {
+                                        to_rgb(ray.aop().angle().get::<degree>(), -90.0, 90.0)
+                                            .expect("aop in between -90 and 90")
+                                    }
+                                    None => [255, 255, 255],
+                                })
+                                .collect();
 
-                        // Map the AoP values in the RayImage to RGB colours.
-                        // Draw missing pixels as white.
-                        let aop_image: Vec<u8> = ray_image
-                            .ray_pixels()
-                            .flat_map(|pixel| match pixel {
-                                Some(ray) => to_rgb(ray.aop().angle().get::<degree>(), -90.0, 90.0)
-                                    .expect("aop in between -90 and 90"),
-                                None => [255, 255, 255],
-                            })
-                            .collect();
-
-                        // Save the buffer of RGB pixels as a PNG.
-                        let aop_image_filename =
-                            format!("{}_{}.png", i, image.header.stamp.nanosec);
-                        image::save_buffer(
-                            &aop_image_filename,
-                            &aop_image,
-                            image.width,
-                            image.height,
-                            image::ExtendedColorType::Rgb8,
-                        )
-                        .expect("valid image and path");
+                            // Save the buffer of RGB pixels as a PNG.
+                            let aop_image_filename =
+                                format!("{}_{}.png", i, image.header.stamp.nanosec);
+                            image::save_buffer(
+                                &aop_image_filename,
+                                &aop_image,
+                                image.width,
+                                image.height,
+                                image::ExtendedColorType::Rgb8,
+                            )
+                            .expect("valid image and path");
+                        }
                     }
 
                     println!("wrote estimate for camera frame");
